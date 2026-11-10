@@ -149,6 +149,7 @@ type Clearance struct {
 	names     []string
 	values    map[string]string
 	UserAgent string
+	earned    time.Time
 }
 
 func (c *Clearance) set(name, value string) {
@@ -168,7 +169,7 @@ func (c *Clearance) Header() string {
 }
 
 func (c *Clearance) clone() *Clearance {
-	out := &Clearance{names: slices.Clone(c.names), values: make(map[string]string, len(c.values)), UserAgent: c.UserAgent}
+	out := &Clearance{names: slices.Clone(c.names), values: make(map[string]string, len(c.values)), UserAgent: c.UserAgent, earned: c.earned}
 	for k, v := range c.values {
 		out.values[k] = v
 	}
@@ -193,6 +194,7 @@ type Handler struct {
 	solveMu            sync.Mutex
 	sessionReady       bool
 	repairBlockedUntil time.Time
+	lastRebuild        time.Time
 }
 
 // New returns the handler.
@@ -269,9 +271,13 @@ func (h *Handler) postHTTP(payload map[string]any, timeout time.Duration) (*Answ
 
 // isProxyConnectionFailure identifies the Chrome failure a fresh
 // proxy-bound session can repair.
+//
+// A session that no longer exists (FlareSolverr restarted, or someone
+// destroyed it) is repaired the same way: by creating it again.
 func isProxyConnectionFailure(err error) bool {
 	text := strings.ToLower(err.Error())
-	return strings.Contains(text, "err_proxy_connection_failed") || strings.Contains(text, "proxy connection failed")
+	return strings.Contains(text, "err_proxy_connection_failed") || strings.Contains(text, "proxy connection failed") ||
+		strings.Contains(text, "session doesn't exist") || strings.Contains(text, "session does not exist")
 }
 
 func (h *Handler) createPayload() map[string]any {
@@ -375,7 +381,7 @@ func (h *Handler) solve(url string) *Solution {
 }
 
 func (h *Handler) remember(site string, solution *Solution) {
-	c := &Clearance{values: map[string]string{}, UserAgent: solution.UserAgent}
+	c := &Clearance{values: map[string]string{}, UserAgent: solution.UserAgent, earned: h.now()}
 	for _, cookie := range solution.Cookies {
 		if cookie.Name != "" {
 			c.set(cookie.Name, cookie.Value)
@@ -421,6 +427,38 @@ func refetchWith(client *http.Client, url string, held *Clearance, log *slog.Log
 	return resp.StatusCode, body, true
 }
 
+// freshClearance is how soon after its solve a refused clearance counts as
+// never having worked.
+const freshClearance = 5 * time.Minute
+
+// isChallenge tells a Cloudflare challenge page from an origin answer.
+func isChallenge(status int, body []byte) bool {
+	if status != http.StatusForbidden && status != http.StatusServiceUnavailable {
+		return false
+	}
+	return bytes.Contains(body, []byte("challenge-platform")) || bytes.Contains(body, []byte("<title>Just a moment"))
+}
+
+func (h *Handler) forgetClearance() {
+	h.mu.Lock()
+	clear(h.clearance)
+	h.mu.Unlock()
+}
+
+// rebuildSession recreates the session at most once per RepairCooldown.
+// Called with solveMu held.
+func (h *Handler) rebuildSession() {
+	if !h.lastRebuild.IsZero() && h.now().Sub(h.lastRebuild) < h.cfg.RepairCooldown {
+		return
+	}
+	h.lastRebuild = h.now()
+	if err := h.resetSession(); err != nil {
+		// Leave sessionReady false so the next solve tries a one-shot
+		// browser, which takes the exit per request.
+		h.log.Warn("FlareSolverr session could not be rebuilt", "session", h.cfg.Session, "error", err)
+	}
+}
+
 func html(req *http.Request, status int, body []byte) *http.Response {
 	return httpx.Text(req, status, "text/html; charset=utf-8", body)
 }
@@ -430,16 +468,34 @@ func html(req *http.Request, status int, body []byte) *http.Response {
 // Callers arriving together queue on one lock, so an expiry costs a single
 // solve however many requests tripped over it. Whoever gets in first pays the
 // ~11s; the rest find fresh clearance waiting and re-fetch with it.
-func (h *Handler) serveFromSolver(req *http.Request, site string) *http.Response {
+//
+// suspect says the session has just handed over a clearance the exit refused;
+// it is rebuilt before the solve.
+func (h *Handler) serveFromSolver(req *http.Request, site string, suspect bool) *http.Response {
 	used := strings.Join(req.Header.Values("Cookie"), "; ")
 	url := req.URL.String()
 
 	h.solveMu.Lock()
 	defer h.solveMu.Unlock()
 
+	if suspect && h.held(site) == nil {
+		h.log.Warn("fresh clearance was refused at the exit; rebuilding the session", "site", site, "session", h.cfg.Session)
+		h.rebuildSession()
+	}
+
 	if held := h.held(site); held != nil && !strings.Contains(used, held.Header()) {
-		if status, body, ok := h.fetch(url, held); ok {
+		status, body, ok := h.fetch(url, held)
+		switch {
+		case ok && !isChallenge(status, body):
 			return html(req, status, body)
+		case ok:
+			// Clearance that is challenged at the exit straight away was not
+			// earned there: the session's browser is leaving from somewhere
+			// else. Every solve from it would hand over the same useless
+			// cookie, so rebuild it before solving.
+			h.log.Warn("fresh clearance was challenged at the exit; rebuilding the session", "site", site, "session", h.cfg.Session)
+			h.forgetClearance()
+			h.rebuildSession()
 		}
 	}
 
@@ -482,7 +538,7 @@ func (h *Handler) Request(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Reque
 		h.dress(req, ctx, held)
 		return req, nil
 	}
-	return req, h.serveFromSolver(req, site)
+	return req, h.serveFromSolver(req, site, false)
 }
 
 // harvest follows Cloudflare's cookie rotation so the stored clearance stays
@@ -528,10 +584,14 @@ func (h *Handler) Response(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Res
 		return resp
 	}
 	state.Retried = true
-	h.log.Info("clearance was refused; getting a new one", "site", site)
 	h.mu.Lock()
+	held := h.clearance[site]
 	delete(h.clearance, site)
 	h.mu.Unlock()
+	// Cloudflare's clearance lasts far longer than this; one refused within
+	// minutes of its solve was never good at the exit.
+	suspect := held != nil && h.now().Sub(held.earned) < freshClearance
+	h.log.Info("clearance was refused; getting a new one", "site", site, "fresh", suspect)
 	_ = resp.Body.Close()
-	return h.serveFromSolver(req, site)
+	return h.serveFromSolver(req, site, suspect)
 }

@@ -2,6 +2,7 @@ package flaresolverr
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -276,5 +277,111 @@ func TestChallengedResponseIsSolvedOnceAndNotLooped(t *testing.T) {
 	again := h.Response(challenged(), ctx)
 	if again.StatusCode != 403 || solves != 1 {
 		t.Fatalf("retried a retry: %d after %d solves", again.StatusCode, solves)
+	}
+}
+
+func freshSolve(value string) *Answer {
+	return &Answer{Solution: &Solution{Status: 200, Response: "<html>ok</html>", UserAgent: "Chrome",
+		Cookies: []struct {
+			Name  string `json:"name"`
+			Value string `json:"value"`
+		}{{"cf_clearance", value}}}}
+}
+
+const challengePage = `<html><head><title>Just a moment...</title></head><script src="/cdn-cgi/challenge-platform/h/b/orchestrate"></script></html>`
+
+// A session whose browser does not leave through the exit hands over
+// clearance the exit refuses at once. The re-fetch that shows it rebuilds the
+// session and solves again instead of passing the challenge on.
+func TestClearanceChallengedOnRefetchRebuildsSession(t *testing.T) {
+	solves := 0
+	h, calls := newHandler(t, func(payload map[string]any, _ []post) (*Answer, error) {
+		switch payload["cmd"] {
+		case "request.get":
+			solves++
+			return freshSolve(fmt.Sprintf("v%d", solves)), nil
+		case "sessions.list":
+			return &Answer{Sessions: []string{}}, nil
+		}
+		return &Answer{}, nil
+	})
+	h.fetch = func(url string, held *Clearance) (int, []byte, bool) {
+		return 403, []byte(challengePage), true
+	}
+	req := httptest.NewRequest(http.MethodGet, "https://www.javlibrary.com/cn/", nil)
+	req.Header.Set("Cookie", "cf_clearance=stale")
+	resp := h.serveFromSolver(req, "javlibrary.com", false)
+	if resp.StatusCode != 200 || solves != 1 {
+		t.Fatalf("got %d after %d solves", resp.StatusCode, solves)
+	}
+	got := cmds(*calls)
+	want := []string{"sessions.destroy", "sessions.list", "sessions.create", "request.get"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("calls %v, want %v", got, want)
+	}
+	// Within the cooldown a second refusal solves again but leaves the
+	// session alone.
+	req2 := httptest.NewRequest(http.MethodGet, "https://www.javlibrary.com/cn/", nil)
+	h.serveFromSolver(req2, "javlibrary.com", false)
+	if n := count(*calls, "sessions.destroy"); n != 1 {
+		t.Fatalf("session rebuilt %d times", n)
+	}
+}
+
+// An origin 403 is an answer, not a challenge.
+func TestOriginForbiddenIsNotAChallenge(t *testing.T) {
+	if isChallenge(403, []byte("<html>forbidden</html>")) {
+		t.Fatal("plain 403 taken for a challenge")
+	}
+	if !isChallenge(403, []byte(challengePage)) {
+		t.Fatal("challenge page missed")
+	}
+}
+
+// A clearance refused minutes after its solve marks the session as suspect.
+func TestFreshClearanceRefusedRebuildsSession(t *testing.T) {
+	h, calls := newHandler(t, func(payload map[string]any, _ []post) (*Answer, error) {
+		switch payload["cmd"] {
+		case "request.get":
+			return freshSolve("new"), nil
+		case "sessions.list":
+			return &Answer{Sessions: []string{}}, nil
+		}
+		return &Answer{}, nil
+	})
+	h.clearance["javlibrary.com"].earned = time.Now().Add(-time.Minute)
+	req := httptest.NewRequest(http.MethodGet, "https://www.javlibrary.com/cn/", nil)
+	ctx := &goproxy.ProxyCtx{Req: req, UserData: &flow.State{}}
+	h.Request(req, ctx)
+	resp := h.Response(&http.Response{StatusCode: 403, Header: http.Header{"Cf-Mitigated": {"challenge"}}, Request: req, Body: io.NopCloser(strings.NewReader(challengePage))}, ctx)
+	if resp.StatusCode != 200 {
+		t.Fatalf("got %d", resp.StatusCode)
+	}
+	if count(*calls, "sessions.destroy") != 1 || count(*calls, "sessions.create") != 1 {
+		t.Fatalf("session not rebuilt: %v", cmds(*calls))
+	}
+}
+
+// A session FlareSolverr no longer knows is created again, like a broken one.
+func TestMissingSessionIsRecreated(t *testing.T) {
+	attempts := 0
+	h, calls := newHandler(t, func(payload map[string]any, _ []post) (*Answer, error) {
+		switch payload["cmd"] {
+		case "request.get":
+			attempts++
+			if attempts == 1 {
+				return nil, &HTTPError{Status: 500, Body: `{"status":"error","message":"Error: This session does not exist."}`}
+			}
+			return freshSolve("new"), nil
+		case "sessions.list":
+			return &Answer{Sessions: []string{}}, nil
+		}
+		return &Answer{}, nil
+	})
+	if h.solve("https://www.javlibrary.com/cn/") == nil {
+		t.Fatal("no solution")
+	}
+	if count(*calls, "sessions.create") != 1 {
+		t.Fatalf("session not recreated: %v", cmds(*calls))
 	}
 }

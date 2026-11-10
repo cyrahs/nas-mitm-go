@@ -24,6 +24,7 @@ nas-mitm gen-ca --dir /certs        # init container: writes ca.crt (0644) and c
 nas-mitm run --certs /certs --listen 127.0.0.1:8080 --intercept-ports 443,80 --handlers flaresolverr,bilibili
 nas-mitm run --certs /certs --socks5 0.0.0.0:1080 --handlers suwayomi
 nas-mitm probe 127.0.0.1:1080       # readiness check (the image has no shell)
+nas-mitm fetch --proxy http://exit:80 -H 'User-Agent: x' https://site/   # one GET with the handlers' HTTP client
 ```
 
 `--socks5` is for clients that only speak SOCKS5 (Suwayomi's JVM proxy

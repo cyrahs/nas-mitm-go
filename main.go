@@ -5,6 +5,7 @@
 //	nas-mitm run --certs /certs --listen 127.0.0.1:8080 --intercept-ports 443,80 --handlers flaresolverr,bilibili
 //	nas-mitm run --certs /certs --socks5 0.0.0.0:1080 --handlers suwayomi
 //	nas-mitm probe 127.0.0.1:1080
+//	nas-mitm fetch --proxy http://exit:80 -H 'User-Agent: x' https://example.com/
 package main
 
 import (
@@ -12,6 +13,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -25,6 +27,7 @@ import (
 	"github.com/cyrahs/nas-mitm-go/internal/ca"
 	"github.com/cyrahs/nas-mitm-go/internal/flaresolverr"
 	"github.com/cyrahs/nas-mitm-go/internal/flow"
+	"github.com/cyrahs/nas-mitm-go/internal/httpx"
 	"github.com/cyrahs/nas-mitm-go/internal/proxy"
 	"github.com/cyrahs/nas-mitm-go/internal/suwayomi"
 )
@@ -41,6 +44,8 @@ func main() {
 		err = run(os.Args[2:])
 	case "probe":
 		err = probe(os.Args[2:])
+	case "fetch":
+		err = fetch(os.Args[2:])
 	default:
 		usage()
 	}
@@ -51,7 +56,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: nas-mitm gen-ca|run|probe [flags]")
+	fmt.Fprintln(os.Stderr, "usage: nas-mitm gen-ca|run|probe|fetch [flags]")
 	os.Exit(2)
 }
 
@@ -77,6 +82,65 @@ func probe(args []string) error {
 		return err
 	}
 	return conn.Close()
+}
+
+type headerFlags []string
+
+func (h *headerFlags) String() string     { return strings.Join(*h, ", ") }
+func (h *headerFlags) Set(v string) error { *h = append(*h, v); return nil }
+
+// fetch makes one GET with the same Go HTTP client the handlers use, so a
+// site's reaction to it (a Cloudflare block, a risk-control code) can be
+// checked from inside the cluster before a handler depends on it.
+func fetch(args []string) error {
+	fs := flag.NewFlagSet("fetch", flag.ExitOnError)
+	proxyURL := fs.String("proxy", "", "HTTP proxy to go through (default direct)")
+	var headers headerFlags
+	fs.Var(&headers, "H", "request header 'Name: value' (repeatable)")
+	limit := fs.Int("bytes", 300, "how much of the body to print")
+	_ = fs.Parse(args)
+	if fs.NArg() != 1 {
+		return errors.New("usage: nas-mitm fetch [--proxy URL] [-H 'Name: value'] URL")
+	}
+	transport, err := httpx.Transport(*proxyURL, false)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest(http.MethodGet, fs.Arg(0), nil)
+	if err != nil {
+		return err
+	}
+	for _, h := range headers {
+		name, value, ok := strings.Cut(h, ":")
+		if !ok {
+			return fmt.Errorf("bad header %q", h)
+		}
+		req.Header.Set(strings.TrimSpace(name), strings.TrimSpace(value))
+	}
+	started := time.Now()
+	resp, err := (&http.Client{Transport: transport, Timeout: 60 * time.Second}).Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	if decoded, err := httpx.Decode(body, resp.Header.Get("Content-Encoding")); err == nil {
+		body = decoded
+	}
+	fmt.Printf("%s in %v, %d bytes, %s\n", resp.Status, time.Since(started).Round(time.Millisecond), len(body), resp.Proto)
+	for _, name := range []string{"Content-Type", "Server", "Cf-Mitigated", "Cf-Ray"} {
+		if v := resp.Header.Get(name); v != "" {
+			fmt.Printf("%s: %s\n", name, v)
+		}
+	}
+	if len(body) > *limit {
+		body = body[:*limit]
+	}
+	fmt.Println(string(body))
+	return nil
 }
 
 type starter interface{ Start(context.Context) }

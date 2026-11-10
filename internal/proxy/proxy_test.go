@@ -249,3 +249,22 @@ func TestPlainHTTPInsideConnect(t *testing.T) {
 		t.Fatalf("response %q", all)
 	}
 }
+
+// A client that resolved the name itself sends an address; the name in its
+// ClientHello decides interception instead.
+func TestSOCKSWithAnAddressUsesTheClientHelloName(t *testing.T) {
+	h := setup(t)
+	roots := x509.NewCertPool()
+	roots.AddCert(h.authority.Certificate())
+	dialer, _ := xproxy.SOCKS5("tcp", h.socksAddr, nil, xproxy.Direct)
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{RootCAs: roots, ServerName: "intercept.test"},
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return dialer.(xproxy.ContextDialer).DialContext(ctx, network, "203.0.113.7:443")
+		},
+	}
+	resp, body := get(t, &http.Client{Transport: transport, Timeout: 10 * time.Second}, "https://intercept.test/by-address")
+	if !signedByPodCA(resp) || resp.Header.Get("X-Origin-Saw") != "yes" || body != "origin intercept.test/by-address" {
+		t.Fatalf("not intercepted: %v %q", resp.Header, body)
+	}
+}

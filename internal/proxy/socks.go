@@ -134,31 +134,56 @@ func serveSOCKS5Conn(client net.Conn, httpProxy string) error {
 	if _, err := io.ReadFull(reader, portBytes); err != nil {
 		return err
 	}
-	target := net.JoinHostPort(host, strconv.Itoa(int(binary.BigEndian.Uint16(portBytes))))
+	port := strconv.Itoa(int(binary.BigEndian.Uint16(portBytes)))
+
+	// A client that resolved the name itself sends only an address, and
+	// interception is decided by name. Answer first, then read the name the
+	// client puts in its TLS ClientHello.
+	answered := false
+	if net.ParseIP(host) != nil {
+		if err := reply(client, replySucceeded); err != nil {
+			return err
+		}
+		answered = true
+		if sni := peekSNI(reader); sni != "" {
+			host = sni
+		}
+	}
+	target := net.JoinHostPort(host, port)
 
 	upstream, err := net.DialTimeout("tcp", httpProxy, 10*time.Second)
 	if err != nil {
-		_ = reply(client, replyGeneralFailure)
+		if !answered {
+			_ = reply(client, replyGeneralFailure)
+		}
 		return err
 	}
 	defer upstream.Close()
 	_ = upstream.SetDeadline(time.Now().Add(30 * time.Second))
 	if _, err := fmt.Fprintf(upstream, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", target, target); err != nil {
-		_ = reply(client, replyGeneralFailure)
+		if !answered {
+			_ = reply(client, replyGeneralFailure)
+		}
 		return err
 	}
 	upstreamReader := bufio.NewReader(upstream)
 	resp, err := http.ReadResponse(upstreamReader, &http.Request{Method: http.MethodConnect})
 	if err != nil {
-		_ = reply(client, replyGeneralFailure)
+		if !answered {
+			_ = reply(client, replyGeneralFailure)
+		}
 		return err
 	}
 	if resp.StatusCode != http.StatusOK {
-		_ = reply(client, replyHostUnreachable)
+		if !answered {
+			_ = reply(client, replyHostUnreachable)
+		}
 		return fmt.Errorf("CONNECT %s: %s", target, resp.Status)
 	}
-	if err := reply(client, replySucceeded); err != nil {
-		return err
+	if !answered {
+		if err := reply(client, replySucceeded); err != nil {
+			return err
+		}
 	}
 	_ = client.SetDeadline(time.Time{})
 	_ = upstream.SetDeadline(time.Time{})
@@ -191,4 +216,75 @@ func closeWrite(conn net.Conn) {
 		return
 	}
 	_ = conn.Close()
+}
+
+// peekSNI returns the server name from a TLS ClientHello at the head of r
+// without consuming it, or "" when there is none.
+func peekSNI(r *bufio.Reader) string {
+	header, err := r.Peek(5)
+	if err != nil || header[0] != 0x16 {
+		return ""
+	}
+	length := int(binary.BigEndian.Uint16(header[3:5]))
+	if length > r.Size()-5 {
+		length = r.Size() - 5
+	}
+	record, err := r.Peek(5 + length)
+	if err != nil {
+		return ""
+	}
+	return parseSNI(record[5:])
+}
+
+// parseSNI reads the server_name extension of a ClientHello handshake message.
+func parseSNI(b []byte) string {
+	// handshake type (1 = ClientHello), 3-byte length, version, random.
+	if len(b) < 38 || b[0] != 1 {
+		return ""
+	}
+	b = b[38:]
+	skip := func(lenBytes int) bool {
+		if len(b) < lenBytes {
+			return false
+		}
+		n := 0
+		for i := 0; i < lenBytes; i++ {
+			n = n<<8 | int(b[i])
+		}
+		if len(b) < lenBytes+n {
+			return false
+		}
+		b = b[lenBytes+n:]
+		return true
+	}
+	// session id, cipher suites, compression methods.
+	if !skip(1) || !skip(2) || !skip(1) || len(b) < 2 {
+		return ""
+	}
+	b = b[2:] // extensions length
+	for len(b) >= 4 {
+		extType := binary.BigEndian.Uint16(b[0:2])
+		extLen := int(binary.BigEndian.Uint16(b[2:4]))
+		if len(b) < 4+extLen {
+			return ""
+		}
+		data := b[4 : 4+extLen]
+		b = b[4+extLen:]
+		if extType != 0 || len(data) < 2 {
+			continue
+		}
+		list := data[2:]
+		for len(list) >= 3 {
+			nameType := list[0]
+			nameLen := int(binary.BigEndian.Uint16(list[1:3]))
+			if len(list) < 3+nameLen {
+				return ""
+			}
+			if nameType == 0 {
+				return string(list[3 : 3+nameLen])
+			}
+			list = list[3+nameLen:]
+		}
+	}
+	return ""
 }
